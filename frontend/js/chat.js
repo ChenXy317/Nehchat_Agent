@@ -93,8 +93,7 @@ export async function deleteSlotAction(index) {
 
 export function backToSlots() {
   if (state.streaming) {
-    if (state.abortController) state.abortController.abort();
-    setStreaming(false);
+    cancelStream();
   }
   state.currentSlotIndex = null;
   state.currentSlotData = null;
@@ -666,6 +665,7 @@ export async function regenerate(userMsgId) {
 export function cancelStream() {
   if (!state.streaming) return;
   state.streamCancelled = true;
+  const currentSlot = state.currentSlotIndex;
   if (state.currentReader) {
     try { state.currentReader.cancel(); } catch (_) { /* 忽略 */ }
     state.currentReader = null;
@@ -673,6 +673,9 @@ export function cancelStream() {
   if (state.abortController) {
     state.abortController.abort();
     state.abortController = null;
+  }
+  if (currentSlot !== null) {
+    apiPost(`/api/slots/${currentSlot}/chat/cancel`, {}).catch(() => {});
   }
 }
 

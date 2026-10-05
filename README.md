@@ -273,6 +273,7 @@ AI_project/
 |---|---|---|
 | `POST` | `/api/chat` | 流式对话 SSE（单/双分流，失败自动回滚） |
 | `POST` | `/api/slots/{i}/chat/continue` | 继续回复（单模型合并续写、双模型各回复一轮） |
+| `POST` | `/api/slots/{i}/chat/cancel` | 取消当前流式回复并释放锁 |
 
 ### 模型目录
 

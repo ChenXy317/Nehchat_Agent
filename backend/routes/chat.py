@@ -11,6 +11,7 @@ import asyncio
 import re
 from typing import AsyncGenerator
 
+import anyio
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["chat"])
 _slot_locks: dict[tuple[int, int], asyncio.Lock] = {}
+_slot_tasks: dict[tuple[int, int], asyncio.Task] = {}
 
 
 def _slot_lock(user_id: int, slot_index: int) -> asyncio.Lock:
@@ -38,12 +40,18 @@ async def _db_call(method, *args):
 
 
 async def _locked_stream(user_id: int, slot_index: int, source):
+    """带并发互斥保护与取消支持的 SSE 流式生成器。"""
+    key = (user_id, slot_index)
+    curr_task = asyncio.current_task()
+    if curr_task:
+        _slot_tasks[key] = curr_task
+
     lock = _slot_lock(user_id, slot_index)
     acquired = False
     lock_conn = None
     try:
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=0.05)
+            await asyncio.wait_for(lock.acquire(), timeout=1.0)
             acquired = True
         except asyncio.TimeoutError:
             yield _sse({
@@ -65,19 +73,38 @@ async def _locked_stream(user_id: int, slot_index: int, source):
         async for event in source:
             yield event
     finally:
-        aclose = getattr(source, "aclose", None)
-        if callable(aclose):
-            try:
-                await aclose()
-            except Exception:
-                logger.warning("关闭对话流时出错", exc_info=True)
-        if lock_conn is not None:
-            try:
-                await _db_call(get_slot_mgr().release_slot_lock, lock_conn, user_id, slot_index)
-            except Exception:
-                logger.warning("释放存档锁时出错", exc_info=True)
+        if curr_task and _slot_tasks.get(key) is curr_task:
+            _slot_tasks.pop(key, None)
+        with anyio.CancelScope(shield=True):
+            aclose = getattr(source, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except BaseException as e:
+                    logger.warning(f"关闭对话流时出错: {e}")
+            if lock_conn is not None:
+                try:
+                    await _db_call(get_slot_mgr().release_slot_lock, lock_conn, user_id, slot_index)
+                except BaseException as e:
+                    logger.warning(f"释放存档锁时出错: {e}")
         if acquired:
-            lock.release()
+            try:
+                lock.release()
+            except RuntimeError:
+                pass
+
+
+@router.post("/api/slots/{slot_index}/chat/cancel")
+async def cancel_chat(slot_index: int, user: dict = Depends(current_user)):
+    """取消当前存档正在运行的流式回复任务。"""
+    uid = user["id"]
+    key = (uid, slot_index)
+    task = _slot_tasks.get(key)
+    if task and not task.done():
+        task.cancel()
+        logger.info(f"已取消用户 #{uid} 存档 #{slot_index + 1} 的生成任务")
+        return {"ok": True, "cancelled": True}
+    return {"ok": True, "cancelled": False}
 
 # ── 固定图标 ──
 MODEL1_ICON = "🎭"

@@ -273,6 +273,7 @@ Errors are uniform `{code, message, detail}`; the frontend maps them to localize
 |---|---|---|
 | `POST` | `/api/chat` | Streaming chat SSE (single/dual routing, auto rollback on failure) |
 | `POST` | `/api/slots/{i}/chat/continue` | Continue reply (single: merged continuation; dual: both reply a round) |
+| `POST` | `/api/slots/{i}/chat/cancel` | Cancel current streaming reply and release lock |
 
 ### Model Catalog
 
