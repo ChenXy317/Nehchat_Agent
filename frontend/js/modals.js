@@ -480,6 +480,11 @@ export async function openExportModal() {
       const roleLabel = msg.role === "user" ? "👤 **你**" : "🤖 **AI**";
       lines.push(`### ${roleLabel}`);
       lines.push("");
+      const attachmentNames = (msg.attachments || []).map((item) => item.name).filter(Boolean);
+      if (attachmentNames.length) {
+        lines.push(`附件: ${attachmentNames.join("、")}`);
+        lines.push("");
+      }
       lines.push(msg.content || "");
       lines.push("");
     }

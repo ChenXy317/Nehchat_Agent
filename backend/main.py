@@ -27,6 +27,7 @@ from routes.backgrounds import router as backgrounds_router, file_router as back
 from routes.catalog import router as catalog_router
 from routes.auth import router as auth_router
 from routes.admin import router as admin_router
+from routes.uploads import router as uploads_router
 
 # ── Logging ──
 
@@ -47,6 +48,11 @@ async def lifespan(app: FastAPI):
         slot_mgr = SlotManager()
         account_mgr = AccountManager(slot_mgr.pool)
         init_state(ai_client, slot_mgr, account_mgr)
+        try:
+            from attachments import cleanup_stale
+            cleanup_stale()
+        except Exception:
+            logger.warning("清理临时附件失败", exc_info=True)
         logger.info("服务初始化完成")
     except RuntimeError as e:
         logger.critical(f"服务启动失败: {e}")
@@ -96,6 +102,7 @@ app.include_router(backgrounds_router)
 app.include_router(backgrounds_file_router)
 app.include_router(auth_router)
 app.include_router(admin_router)
+app.include_router(uploads_router)
 
 
 # ── 全局异常处理器（返回结构化错误） ──

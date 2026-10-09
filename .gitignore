@@ -26,6 +26,10 @@ backend/sessions/
 backend/backgrounds/*
 !backend/backgrounds/.gitkeep
 
+# 对话附件（用户本地资源）
+backend/uploads/*
+!backend/uploads/.gitkeep
+
 # IDE
 .vscode/
 .idea/

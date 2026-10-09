@@ -225,6 +225,27 @@ class SlotManager:
                         "ALTER TABLE `slots` MODIFY COLUMN `model` VARCHAR(192) NOT NULL DEFAULT ''"
                     )
                     logger.info("已扩展 slots.model 为 VARCHAR(192)")
+                cursor.execute("SHOW COLUMNS FROM `messages` LIKE 'attachments'")
+                if not cursor.fetchone():
+                    cursor.execute(
+                        "ALTER TABLE `messages` ADD COLUMN `attachments` TEXT NULL AFTER `content`"
+                    )
+                    logger.info("已添加 attachments 列到 messages 表")
+                cursor.execute("""
+                    CREATE TABLE IF NOT EXISTS uploads (
+                        id VARCHAR(32) NOT NULL PRIMARY KEY,
+                        user_id INT NOT NULL,
+                        original_name VARCHAR(255) NOT NULL DEFAULT '',
+                        mime VARCHAR(128) NOT NULL DEFAULT '',
+                        kind VARCHAR(16) NOT NULL DEFAULT '',
+                        size INT NOT NULL DEFAULT 0,
+                        ext VARCHAR(16) NOT NULL DEFAULT '',
+                        message_id INT NULL,
+                        created_at VARCHAR(32) DEFAULT '',
+                        INDEX idx_uploads_user (user_id),
+                        INDEX idx_uploads_message (message_id)
+                    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                """)
                 cursor.execute("SHOW COLUMNS FROM `messages` LIKE 'content'")
                 content_col = cursor.fetchone()
                 content_type = str((content_col or {}).get("Type", "")).lower()
@@ -389,25 +410,33 @@ class SlotManager:
                     slot["params"] = self._json_or_default(slot.get("params"), {})
                     slot["dual_config"] = self._json_or_default(slot.get("dual_config"), {})
                     cursor.execute(
-                        "SELECT id, role, content, source FROM messages "
+                        "SELECT id, role, content, source, attachments FROM messages "
                         "WHERE user_id = %s AND slot_id = %s ORDER BY id ASC",
                         (user_id, index),
                     )
-                    slot["history"] = list(cursor.fetchall())
+                    history = list(cursor.fetchall())
+                    for row in history:
+                        parsed = self._json_or_default(row.get("attachments"), [])
+                        row["attachments"] = parsed if isinstance(parsed, list) else []
+                    slot["history"] = history
                     return slot
         except pymysql.Error as e:
             logger.error(f"get_slot(user={user_id}, {index}) 失败: {e}")
             return None
 
     def delete_slot(self, user_id: int, index: int) -> bool:
+        file_ids: List[str] = []
         try:
             with self._transaction() as conn:
                 with conn.cursor() as cursor:
+                    file_ids = self._take_attachment_ids(cursor, user_id, "slot_id = %s", (index,))
                     cursor.execute(
                         "DELETE FROM slots WHERE user_id = %s AND id = %s",
                         (user_id, index),
                     )
                     deleted = cursor.rowcount > 0
+            if deleted:
+                self._unlink_uploads(user_id, file_ids)
             return deleted
         except pymysql.Error as e:
             logger.error(f"delete_slot(user={user_id}, {index}) 失败: {e}")
@@ -458,27 +487,127 @@ class SlotManager:
                     if not cursor.fetchone():
                         return False
                     cursor.execute(
+                        "SELECT attachments FROM messages WHERE user_id = %s AND slot_id = %s",
+                        (user_id, index),
+                    )
+                    old_ids = set(self._ids_from_attachment_rows(cursor.fetchall()))
+                    new_ids = set(self._ids_from_attachment_rows(
+                        [{"attachments": m.get("attachments")} for m in history]
+                    ))
+                    removed = [fid for fid in old_ids if fid not in new_ids]
+                    reused = [fid for fid in old_ids if fid in new_ids]
+                    if removed:
+                        ph = ", ".join(["%s"] * len(removed))
+                        cursor.execute(
+                            f"DELETE FROM uploads WHERE user_id = %s AND id IN ({ph})",
+                            (user_id, *removed),
+                        )
+                    if reused:
+                        ph = ", ".join(["%s"] * len(reused))
+                        cursor.execute(
+                            f"UPDATE uploads SET message_id = NULL WHERE user_id = %s AND id IN ({ph})",
+                            (user_id, *reused),
+                        )
+                    cursor.execute(
                         "DELETE FROM messages WHERE user_id = %s AND slot_id = %s",
                         (user_id, index),
                     )
                     if history:
-                        cursor.executemany(
-                            "INSERT INTO messages (slot_id, user_id, role, content, source) VALUES (%s, %s, %s, %s, %s)",
-                            [
-                                (index, user_id, m.get("role", ""), m.get("content", ""), m.get("source", ""))
-                                for m in history
-                            ],
-                        )
+                        for m in history:
+                            self._insert_message(cursor, user_id, index, m)
                     cursor.execute(
                         "UPDATE slots SET updated_at = %s WHERE user_id = %s AND id = %s",
                         (self._now(), user_id, index),
                     )
+            self._unlink_uploads(user_id, removed)
             return True
         except pymysql.Error as e:
             logger.error(f"save_slot_history(user={user_id}, {index}) 失败: {e}")
             return False
 
     # ── append-only 写入 ──
+
+    @staticmethod
+    def _dump_attachments(value) -> Optional[str]:
+        if not value:
+            return None
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return json.dumps(value, ensure_ascii=False)
+        return None
+
+    @staticmethod
+    def _ids_from_attachment_rows(rows) -> List[str]:
+        ids: List[str] = []
+        seen = set()
+        for row in rows or []:
+            raw = row.get("attachments") if isinstance(row, dict) else row
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw or "null")
+                except json.JSONDecodeError:
+                    raw = None
+            if not isinstance(raw, list):
+                continue
+            for att in raw:
+                if isinstance(att, dict) and att.get("id"):
+                    fid = str(att["id"])
+                    if fid not in seen:
+                        seen.add(fid)
+                        ids.append(fid)
+        return ids
+
+    def _insert_message(self, cursor, user_id: int, slot_id: int, message: dict) -> int:
+        attachments = message.get("attachments") or []
+        if not isinstance(attachments, list):
+            attachments = []
+        cursor.execute(
+            "INSERT INTO messages (slot_id, user_id, role, content, source, attachments) "
+            "VALUES (%s, %s, %s, %s, %s, %s)",
+            (
+                slot_id,
+                user_id,
+                message.get("role", ""),
+                message.get("content", ""),
+                message.get("source", ""),
+                self._dump_attachments(attachments),
+            ),
+        )
+        message_id = cursor.lastrowid
+        upload_ids = [str(a.get("id")) for a in attachments if isinstance(a, dict) and a.get("id")]
+        if upload_ids:
+            unique_ids = list(dict.fromkeys(upload_ids))
+            ph = ", ".join(["%s"] * len(unique_ids))
+            cursor.execute(
+                f"UPDATE uploads SET message_id = %s "
+                f"WHERE user_id = %s AND message_id IS NULL AND id IN ({ph})",
+                (message_id, user_id, *unique_ids),
+            )
+            if cursor.rowcount != len(unique_ids):
+                raise pymysql.err.InternalError("附件不存在或已使用")
+        return message_id
+
+    def _take_attachment_ids(self, cursor, user_id: int, where_sql: str, params: tuple) -> List[str]:
+        cursor.execute(
+            f"SELECT attachments FROM messages WHERE user_id = %s AND {where_sql}",
+            (user_id, *params),
+        )
+        ids = self._ids_from_attachment_rows(cursor.fetchall())
+        if ids:
+            ph = ", ".join(["%s"] * len(ids))
+            cursor.execute(
+                f"DELETE FROM uploads WHERE user_id = %s AND id IN ({ph})",
+                (user_id, *ids),
+            )
+        return ids
+
+    @staticmethod
+    def _unlink_uploads(user_id: int, upload_ids: List[str]) -> None:
+        if not upload_ids:
+            return
+        from attachments import delete_files
+        delete_files(user_id, upload_ids)
 
     def append_messages(self, user_id: int, slot_id: int, messages: List[Dict]) -> List[int]:
         try:
@@ -487,11 +616,7 @@ class SlotManager:
                     # 逐条插入并记录每条真实 ID
                     ids = []
                     for m in messages:
-                        cursor.execute(
-                            "INSERT INTO messages (slot_id, user_id, role, content, source) VALUES (%s, %s, %s, %s, %s)",
-                            (slot_id, user_id, m.get("role", ""), m.get("content", ""), m.get("source", "")),
-                        )
-                        ids.append(cursor.lastrowid)
+                        ids.append(self._insert_message(cursor, user_id, slot_id, m))
                     cursor.execute(
                         "UPDATE slots SET updated_at = %s WHERE user_id = %s AND id = %s",
                         (self._now(), user_id, slot_id),
@@ -502,9 +627,13 @@ class SlotManager:
             return []
 
     def delete_messages_from(self, user_id: int, slot_id: int, from_message_id: int) -> bool:
+        file_ids: List[str] = []
         try:
             with self._transaction() as conn:
                 with conn.cursor() as cursor:
+                    file_ids = self._take_attachment_ids(
+                        cursor, user_id, "slot_id = %s AND id >= %s", (slot_id, from_message_id),
+                    )
                     cursor.execute(
                         "DELETE FROM messages WHERE user_id = %s AND slot_id = %s AND id >= %s",
                         (user_id, slot_id, from_message_id),
@@ -513,6 +642,7 @@ class SlotManager:
                         "UPDATE slots SET updated_at = %s WHERE user_id = %s AND id = %s",
                         (self._now(), user_id, slot_id),
                     )
+            self._unlink_uploads(user_id, file_ids)
             return True
         except pymysql.Error as e:
             logger.error(f"delete_messages_from(user={user_id}, {slot_id}, {from_message_id}) 失败: {e}")
@@ -520,9 +650,13 @@ class SlotManager:
 
     def delete_messages_after(self, user_id: int, slot_id: int, after_message_id: int) -> bool:
         """删除某条消息之后的全部消息，保留该条本身。"""
+        file_ids: List[str] = []
         try:
             with self._transaction() as conn:
                 with conn.cursor() as cursor:
+                    file_ids = self._take_attachment_ids(
+                        cursor, user_id, "slot_id = %s AND id > %s", (slot_id, after_message_id),
+                    )
                     cursor.execute(
                         "DELETE FROM messages WHERE user_id = %s AND slot_id = %s AND id > %s",
                         (user_id, slot_id, after_message_id),
@@ -531,6 +665,7 @@ class SlotManager:
                         "UPDATE slots SET updated_at = %s WHERE user_id = %s AND id = %s",
                         (self._now(), user_id, slot_id),
                     )
+            self._unlink_uploads(user_id, file_ids)
             return True
         except pymysql.Error as e:
             logger.error(f"delete_messages_after(user={user_id}, {slot_id}, {after_message_id}) 失败: {e}")
@@ -542,7 +677,7 @@ class SlotManager:
             with self._transaction() as conn:
                 with conn.cursor() as cursor:
                     cursor.execute(
-                        "SELECT id, role, content, source, created_at FROM messages "
+                        "SELECT id, role, content, source, attachments, created_at FROM messages "
                         "WHERE user_id = %s AND slot_id = %s AND id > %s ORDER BY id ASC",
                         (user_id, slot_id, after_message_id),
                     )
@@ -559,8 +694,8 @@ class SlotManager:
             with self._transaction() as conn:
                 with conn.cursor() as cursor:
                     cursor.executemany(
-                        "INSERT INTO messages (id, slot_id, user_id, role, content, source, created_at) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        "INSERT INTO messages (id, slot_id, user_id, role, content, source, attachments, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                         [
                             (
                                 r.get("id"),
@@ -569,6 +704,7 @@ class SlotManager:
                                 r.get("role", ""),
                                 r.get("content", ""),
                                 r.get("source", ""),
+                                r.get("attachments") if isinstance(r.get("attachments"), str) else self._dump_attachments(r.get("attachments")),
                                 r.get("created_at") or "",
                             )
                             for r in rows
@@ -583,10 +719,14 @@ class SlotManager:
         """按消息 ID 精确删除（用于删除中间一段消息，不改变其余消息 ID）。"""
         if not message_ids:
             return True
+        file_ids: List[str] = []
         try:
             with self._transaction() as conn:
                 with conn.cursor() as cursor:
                     placeholders = ", ".join(["%s"] * len(message_ids))
+                    file_ids = self._take_attachment_ids(
+                        cursor, user_id, f"slot_id = %s AND id IN ({placeholders})", (slot_id, *message_ids),
+                    )
                     cursor.execute(
                         f"DELETE FROM messages WHERE user_id = %s AND slot_id = %s AND id IN ({placeholders})",
                         (user_id, slot_id, *message_ids),
@@ -595,15 +735,18 @@ class SlotManager:
                         "UPDATE slots SET updated_at = %s WHERE user_id = %s AND id = %s",
                         (self._now(), user_id, slot_id),
                     )
+            self._unlink_uploads(user_id, file_ids)
             return True
         except pymysql.Error as e:
             logger.error(f"delete_messages_by_ids(user={user_id}, {slot_id}) 失败: {e}")
             return False
 
     def clear_all_messages(self, user_id: int, slot_id: int) -> bool:
+        file_ids: List[str] = []
         try:
             with self._transaction() as conn:
                 with conn.cursor() as cursor:
+                    file_ids = self._take_attachment_ids(cursor, user_id, "slot_id = %s", (slot_id,))
                     cursor.execute(
                         "DELETE FROM messages WHERE user_id = %s AND slot_id = %s",
                         (user_id, slot_id),
@@ -612,6 +755,7 @@ class SlotManager:
                         "UPDATE slots SET updated_at = %s WHERE user_id = %s AND id = %s",
                         (self._now(), user_id, slot_id),
                     )
+            self._unlink_uploads(user_id, file_ids)
             return True
         except pymysql.Error as e:
             logger.error(f"clear_all_messages(user={user_id}, {slot_id}) 失败: {e}")

@@ -44,6 +44,8 @@ class ChatRequest(BaseModel):
     message: str = Field(default="", max_length=200_000)
     # 从此用户消息重开：更新正文、删除其后回复，不再插入新的用户消息
     from_id: Optional[int] = None
+    # 先通过 /api/uploads 上传，再把 id 随消息提交
+    attachment_ids: list[str] = Field(default_factory=list, max_length=4)
 
 
 class GenerationParams(BaseModel):
@@ -197,10 +199,20 @@ class ImportSlotRequest(BaseModel):
     messages: list["ImportMessage"] = Field(default_factory=list, max_length=10_000)
 
 
+class ImportAttachment(BaseModel):
+    id: str = Field(default="", max_length=64)
+    name: str = Field(default="", max_length=255)
+    mime: str = Field(default="", max_length=128)
+    kind: str = Field(default="", max_length=16)
+    size: int = 0
+    url: str = Field(default="", max_length=256)
+
+
 class ImportMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(default="", max_length=200_000)
     source: Literal["", "single", "model1", "model2"] = ""
+    attachments: list[ImportAttachment] = Field(default_factory=list, max_length=4)
 
 
 class CatalogModelIn(BaseModel):

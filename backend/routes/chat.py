@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import asyncio
+import contextvars
 import re
 from typing import AsyncGenerator
 
@@ -15,8 +16,15 @@ import anyio
 from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 
+from attachments import (
+    append_model_text,
+    build_user_content,
+    fetch_pending,
+    select_image_ids,
+)
 from auth import current_user
-from config import CONTEXT_WINDOW_SIZE, CONTEXT_MAX_CHARS
+from clients import GenerationCancelled
+from config import CONTEXT_WINDOW_SIZE, CONTEXT_MAX_CHARS, UPLOAD_MAX_TEXT_CHARS
 from helpers import resolve_slot, error, get_runtime
 from models import ChatRequest
 from state import get_ai_client, get_slot_mgr
@@ -25,7 +33,54 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["chat"])
 _slot_locks: dict[tuple[int, int], asyncio.Lock] = {}
-_slot_tasks: dict[tuple[int, int], asyncio.Task] = {}
+
+
+class _SlotRun:
+    """一次流式回复占用的锁、回滚起点和可关闭的上游流。"""
+
+    def __init__(self, user_id: int, slot_index: int):
+        self.user_id = user_id
+        self.slot_index = slot_index
+        self.cancel_event = asyncio.Event()
+        self.task: asyncio.Task | None = None
+        self.lock: asyncio.Lock | None = None
+        self.lock_acquired = False
+        self.lock_conn = None
+        self.locks_released = False
+        self.rollback_id = None
+        self.keep_partial = False
+        self.completed = False
+        self.rolled_back = False
+        self.inflight: asyncio.Future | None = None
+        self._stream = None
+
+    def bind_stream(self, stream) -> None:
+        self._stream = stream
+
+    async def close_stream(self) -> None:
+        stream = self._stream
+        self._stream = None
+        if stream is None:
+            return
+        close = getattr(stream, "close", None)
+        if not close:
+            return
+        try:
+            result = close()
+            if hasattr(result, "__await__"):
+                await result
+        except Exception as e:
+            logger.info(f"关闭上游模型流: {e}")
+
+
+_slot_runs: dict[tuple[int, int], _SlotRun] = {}
+_current_run: contextvars.ContextVar[_SlotRun | None] = contextvars.ContextVar(
+    "nehchat_slot_run", default=None,
+)
+
+
+def _active_run() -> _SlotRun | None:
+    return _current_run.get()
 
 
 def _slot_lock(user_id: int, slot_index: int) -> asyncio.Lock:
@@ -39,20 +94,132 @@ async def _db_call(method, *args):
     return await asyncio.to_thread(method, *args)
 
 
+async def _await_cleanup(awaitable):
+    """清理阶段不受本次请求取消影响，避免锁和回滚被中途打断。"""
+    task = asyncio.current_task()
+    uncancel = getattr(task, "uncancel", None) if task is not None else None
+    if callable(uncancel):
+        while task.cancelling():
+            uncancel()
+    with anyio.CancelScope(shield=True):
+        return await awaitable
+
+
+async def _tracked_db(run: _SlotRun | None, method, *args):
+    """记下尚未结束的写入，取消时也能等到它落库再决定回滚。"""
+    fut = asyncio.ensure_future(asyncio.to_thread(method, *args))
+    if run is not None:
+        run.inflight = fut
+    try:
+        return await fut
+    finally:
+        if run is not None and run.inflight is fut and fut.done():
+            run.inflight = None
+
+
+def _append_tracked(run: _SlotRun | None, user_id: int, slot_index: int, messages: list):
+    ids = get_slot_mgr().append_messages(user_id, slot_index, messages)
+    if run is not None and ids and run.rollback_id is None:
+        run.rollback_id = ids[0]
+    return ids
+
+
+async def _drain_inflight(run: _SlotRun | None) -> None:
+    if run is None:
+        return
+    fut = run.inflight
+    if fut is not None and not fut.done():
+        try:
+            await fut
+        except Exception as e:
+            logger.warning(f"等待未完成的存档写入失败: {e}")
+    if run.inflight is fut:
+        run.inflight = None
+
+
+async def _rollback_run(run: _SlotRun | None) -> None:
+    """删掉这一轮没写完的消息。模型2 普通失败时保留已完成的模型1。"""
+    if run is None:
+        return
+    await _drain_inflight(run)
+    if run.completed or run.keep_partial or run.rolled_back:
+        return
+    rid = run.rollback_id
+    run.rolled_back = True
+    if not rid:
+        return
+    try:
+        await asyncio.to_thread(
+            get_slot_mgr().delete_messages_from,
+            run.user_id,
+            run.slot_index,
+            rid,
+        )
+        logger.info(f"已回滚存档 #{run.slot_index + 1} 未完成的消息（起点 #{rid}）")
+    except Exception as e:
+        run.rolled_back = False
+        logger.warning(f"回滚失败: {e}")
+
+
+async def _release_run(run: _SlotRun | None) -> None:
+    if run is None or run.locks_released:
+        return
+    run.locks_released = True
+    conn = run.lock_conn
+    run.lock_conn = None
+    if conn is not None:
+        try:
+            await asyncio.to_thread(
+                get_slot_mgr().release_slot_lock,
+                conn,
+                run.user_id,
+                run.slot_index,
+            )
+        except Exception as e:
+            logger.warning(f"释放存档锁时出错: {e}")
+            try:
+                conn.close()
+            except Exception:
+                pass
+    if run.lock_acquired and run.lock is not None:
+        run.lock_acquired = False
+        try:
+            run.lock.release()
+        except RuntimeError:
+            pass
+
+
+async def _finish_locked(run: _SlotRun, source, started: bool) -> None:
+    if started:
+        aclose = getattr(source, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception as e:
+                logger.warning(f"关闭对话流时出错: {e}")
+    await _rollback_run(run)
+    await _release_run(run)
+
+
+def _stream_kwargs(run: _SlotRun | None) -> dict:
+    if run is None:
+        return {}
+    return {"cancel_event": run.cancel_event, "on_stream": run.bind_stream}
+
+
 async def _locked_stream(user_id: int, slot_index: int, source):
     """带并发互斥保护与取消支持的 SSE 流式生成器。"""
     key = (user_id, slot_index)
-    curr_task = asyncio.current_task()
-    if curr_task:
-        _slot_tasks[key] = curr_task
-
-    lock = _slot_lock(user_id, slot_index)
-    acquired = False
-    lock_conn = None
+    run = _SlotRun(user_id, slot_index)
+    run.task = asyncio.current_task()
+    run.lock = _slot_lock(user_id, slot_index)
+    _slot_runs[key] = run
+    token = _current_run.set(run)
+    started = False
     try:
         try:
-            await asyncio.wait_for(lock.acquire(), timeout=1.0)
-            acquired = True
+            await asyncio.wait_for(run.lock.acquire(), timeout=1.0)
+            run.lock_acquired = True
         except asyncio.TimeoutError:
             yield _sse({
                 "type": "error",
@@ -61,8 +228,8 @@ async def _locked_stream(user_id: int, slot_index: int, source):
             })
             return
 
-        lock_conn = await _db_call(get_slot_mgr().acquire_slot_lock, user_id, slot_index)
-        if lock_conn is None:
+        run.lock_conn = await _db_call(get_slot_mgr().acquire_slot_lock, user_id, slot_index)
+        if run.lock_conn is None:
             yield _sse({
                 "type": "error",
                 "code": "slot_busy",
@@ -71,40 +238,48 @@ async def _locked_stream(user_id: int, slot_index: int, source):
             return
 
         async for event in source:
+            started = True
             yield event
     finally:
-        if curr_task and _slot_tasks.get(key) is curr_task:
-            _slot_tasks.pop(key, None)
-        with anyio.CancelScope(shield=True):
-            aclose = getattr(source, "aclose", None)
-            if callable(aclose):
-                try:
-                    await aclose()
-                except BaseException as e:
-                    logger.warning(f"关闭对话流时出错: {e}")
-            if lock_conn is not None:
-                try:
-                    await _db_call(get_slot_mgr().release_slot_lock, lock_conn, user_id, slot_index)
-                except BaseException as e:
-                    logger.warning(f"释放存档锁时出错: {e}")
-        if acquired:
-            try:
-                lock.release()
-            except RuntimeError:
-                pass
+        try:
+            await _await_cleanup(_finish_locked(run, source, started))
+        finally:
+            _current_run.reset(token)
+            if _slot_runs.get(key) is run:
+                _slot_runs.pop(key, None)
 
 
 @router.post("/api/slots/{slot_index}/chat/cancel")
 async def cancel_chat(slot_index: int, user: dict = Depends(current_user)):
-    """取消当前存档正在运行的流式回复任务。"""
+    """停止这一轮生成，回滚未完成消息并放开存档锁。"""
     uid = user["id"]
-    key = (uid, slot_index)
-    task = _slot_tasks.get(key)
-    if task and not task.done():
+    run = _slot_runs.get((uid, slot_index))
+    if run is None:
+        return {"ok": True, "cancelled": False}
+
+    run.cancel_event.set()
+    await _await_cleanup(run.close_stream())
+    task = run.task
+    if task is not None and not task.done():
+        await _await_cleanup(_wait_task(task, 8.0))
+    if task is not None and not task.done():
         task.cancel()
-        logger.info(f"已取消用户 #{uid} 存档 #{slot_index + 1} 的生成任务")
-        return {"ok": True, "cancelled": True}
-    return {"ok": True, "cancelled": False}
+        await _await_cleanup(_wait_task(task, 3.0))
+    await _await_cleanup(_rollback_run(run))
+    await _await_cleanup(_release_run(run))
+    logger.info(f"已取消用户 #{uid} 存档 #{slot_index + 1} 的生成任务")
+    return {
+        "ok": True,
+        "cancelled": True,
+        "rolled_back": bool(run.rolled_back and run.rollback_id),
+    }
+
+
+async def _wait_task(task: asyncio.Task, timeout: float) -> None:
+    try:
+        await asyncio.wait([task], timeout=timeout)
+    except Exception:
+        pass
 
 # ── 固定图标 ──
 MODEL1_ICON = "🎭"
@@ -172,12 +347,39 @@ def _exception_error_event(e: Exception, ref_key: str, ref_value) -> dict:
             'content': f'请求失败: {err_str}', ref_key: ref_value}
 
 
-def _clean(items: list) -> list:
-    """只保留 role/content，并去掉历史里残留的思考块。"""
-    return [
-        {"role": m.get("role"), "content": _strip_think(m.get("content") or "")}
-        for m in items
-    ]
+def _model_messages(user_id: int, history: list) -> list:
+    """把历史收成模型消息。带图片的用户消息会变成图文内容。"""
+    image_ids = select_image_ids(history)
+    text_left = [UPLOAD_MAX_TEXT_CHARS]
+    prepared = []
+    for message in history:
+        role = message.get("role")
+        if role == "user":
+            content = build_user_content(
+                user_id,
+                _strip_think(message.get("content") or ""),
+                message.get("attachments"),
+                image_ids,
+                text_left,
+            )
+        else:
+            content = _strip_think(message.get("content") or "")
+        prepared.append({"role": role, "content": content})
+    return prepared
+
+
+async def _to_model_messages(user_id: int, history: list) -> list:
+    return await asyncio.to_thread(_model_messages, user_id, history)
+
+
+def _current_user_content(user_id: int, text: str, attachments) -> object:
+    return build_user_content(
+        user_id,
+        text or "",
+        attachments,
+        select_image_ids([{"role": "user", "attachments": attachments}]),
+        [UPLOAD_MAX_TEXT_CHARS],
+    )
 
 
 def _truncate_history(history: list) -> list:
@@ -197,6 +399,14 @@ def _truncate_history(history: list) -> list:
     return kept
 
 
+def _attachment_title(attachments) -> str:
+    for att in attachments or []:
+        name = (att.get("name") or "").strip()
+        if name:
+            return name
+    return ""
+
+
 def _auto_title(slot_index: int, text: str) -> str:
     """用用户首条消息生成存档标题，空内容时退化为 存档N。"""
     line = (text or "").strip().replace("\n", " ").strip()
@@ -211,6 +421,7 @@ async def _stream_dual_turn(
     data: dict,
     history: list,
     user_content: str,
+    user_attachments: list | None = None,
     persist_user: bool = True,
     inject_user: bool | None = None,
     existing_user_id: int | None = None,
@@ -238,26 +449,32 @@ async def _stream_dual_turn(
 
     user_msg_id = existing_user_id
     msg_ids = []
-    rollback_start_id = None
     completed = False
     failed_role = "model1"
+    run = _active_run()
 
     try:
         # 用户消息：仅普通发消息时落库并作为回滚起点
         if persist_user:
-            saved_ids = await _db_call(get_slot_mgr().append_messages, user_id, slot_index, [
-                {"role": "user", "content": user_content},
-            ])
+            saved_ids = await _tracked_db(
+                run, _append_tracked, run, user_id, slot_index,
+                [{"role": "user", "content": user_content, "attachments": user_attachments or []}],
+            )
             if not saved_ids:
                 raise RuntimeError("数据库写入用户消息失败")
             user_msg_id = saved_ids[0] if saved_ids else None
-            if saved_ids:
-                rollback_start_id = saved_ids[0]
-            history.append({"role": "user", "content": user_content})
+            history.append({
+                "role": "user",
+                "content": user_content,
+                "attachments": user_attachments or [],
+            })
         elif inject_user:
             history.append({"role": "user", "content": user_content})
         else:
             user_msg_id = existing_user_id
+
+        if run is not None and run.cancel_event.is_set():
+            return
 
         # 决定模型顺序
         model_order = ["model1", "model2"]
@@ -272,6 +489,8 @@ async def _stream_dual_turn(
                 continue
             if role == "model2" and not run_model2:
                 continue
+            if run is not None and run.cancel_event.is_set():
+                return
             failed_role = role
 
             is_current_first = (first_resp is None)  # 第一个跑的模型
@@ -298,24 +517,41 @@ async def _stream_dual_turn(
             if is_current_first:
                 # 第一个模型：正常历史（含本轮用户消息）
                 ctx = _truncate_history(history)
-                messages = [{"role": "system", "content": cfg_system}, *_clean(ctx)]
+                messages = [
+                    {"role": "system", "content": cfg_system},
+                    *(await _to_model_messages(user_id, ctx)),
+                ]
             else:
                 # 第二个模型：
                 #   history 目前 = [...历史..., {user: 本轮}, {assistant: 第一模型回复}]
                 #   排除最后两条，取之前的历史
                 prev_src = history[:-2] if len(history) >= 2 else []
                 prev = _truncate_history(prev_src)
-                messages = [{"role": "system", "content": cfg_system}, *_clean(prev)]
-                # 用户原始消息（独立一条）
-                messages.append({"role": "user", "content": user_content})
+                current = history[-2] if len(history) >= 2 else {}
+                user_part = await asyncio.to_thread(
+                    _current_user_content,
+                    user_id,
+                    user_content,
+                    current.get("attachments"),
+                )
+                messages = [
+                    {"role": "system", "content": cfg_system},
+                    *(await _to_model_messages(user_id, prev)),
+                ]
                 # 第一个模型的回答传入
                 first_name = model2_name if first_role == "model2" else model1_name
                 pass_mode = dual_config.get("pass_mode", "user")  # "user" | "assistant"
                 if pass_mode == "assistant":
+                    messages.append({"role": "user", "content": user_part})
                     messages.append({"role": "assistant", "content": f"{first_name}: {first_resp}"})
                 else:
                     # 合并进上一条 user 消息，避免连续两条 user 消息
-                    messages[-1]["content"] = f"{user_content}\n\n[{first_name} 的回复]\n{first_resp}"
+                    messages.append({
+                        "role": "user",
+                        "content": append_model_text(
+                            user_part, f"[{first_name} 的回复]\n{first_resp}",
+                        ),
+                    })
 
             # 发出 model_start 事件
             yield _sse({
@@ -334,30 +570,37 @@ async def _stream_dual_turn(
                     api_key=rt["api_key"],
                     max_tokens=max_tokens,
                     params=cfg_params,
+                    **_stream_kwargs(run),
                 ):
                     chunks.append(chunk)
                     yield _sse({'type': 'chunk', 'content': chunk, 'role': role})
-            except Exception as e:
-                # 模型2调用失败时保留已完成的模型1回复。
+            except BaseException as e:
+                is_cancelled = isinstance(e, (asyncio.CancelledError, GeneratorExit, GenerationCancelled))
+                if run is not None and run.cancel_event.is_set():
+                    is_cancelled = True
+                # 仅在非主动取消的常规异常时，模型2调用失败才保留模型1已完成的回复
                 if (
-                    not is_current_first
-                    and rollback_start_id is not None
+                    not is_cancelled
+                    and not is_current_first
+                    and run is not None
+                    and run.rollback_id is not None
                 ):
-                    rollback_start_id = None
+                    run.keep_partial = True
                 raise
+
+            if run is not None and run.cancel_event.is_set():
+                return
 
             full_response = "".join(chunks)
 
             # 保存到数据库
-            saved = await _db_call(get_slot_mgr().append_messages, user_id, slot_index, [
-                {"role": "assistant", "content": full_response, "source": role},
-            ])
+            saved = await _tracked_db(
+                run, _append_tracked, run, user_id, slot_index,
+                [{"role": "assistant", "content": full_response, "source": role}],
+            )
             if not saved:
                 raise RuntimeError("数据库写入模型回复失败")
             msg_ids.extend(saved)
-            # 继续回复模式：回滚起点设为本轮第一条 assistant 消息
-            if rollback_start_id is None and saved:
-                rollback_start_id = saved[0]
 
             history.append({"role": "assistant", "content": full_response})
 
@@ -377,14 +620,17 @@ async def _stream_dual_turn(
 
         # 自动标题：普通发消息时用用户原文，继续回复不改标题
         if persist_user and not data.get("title", ""):
+            title_src = user_content or _attachment_title(user_attachments)
             if not await _db_call(
                 get_slot_mgr().update_slot_meta,
-                user_id, slot_index, {"title": _auto_title(slot_index, user_content)}
+                user_id, slot_index, {"title": _auto_title(slot_index, title_src)}
             ):
                 logger.warning(f"自动更新存档 #{slot_index + 1} 标题失败")
 
         # 最终 done 事件
         completed = True
+        if run is not None:
+            run.completed = True
         yield _sse({
             'type': 'done',
             'user_message_id': user_msg_id,
@@ -393,7 +639,10 @@ async def _stream_dual_turn(
             'continue_turn': not persist_user,
         })
 
-    except GeneratorExit:
+    except GenerationCancelled:
+        return
+
+    except (asyncio.CancelledError, GeneratorExit):
         raise
 
     except Exception as e:
@@ -407,19 +656,7 @@ async def _stream_dual_turn(
         yield _sse(event)
 
     finally:
-        if not completed and rollback_start_id is not None:
-            try:
-                await _db_call(
-                    get_slot_mgr().delete_messages_from,
-                    user_id,
-                    slot_index,
-                    rollback_start_id,
-                )
-                logger.info(
-                    f"流中断，已回滚存档 #{slot_index + 1} 的消息（起点 #{rollback_start_id}）"
-                )
-            except Exception as e:
-                logger.warning(f"回滚失败: {e}")
+        await _await_cleanup(_rollback_run(run))
 
 
 @router.post("/api/chat")
@@ -427,7 +664,12 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
     """流式对话 — 接收 JSON，返回 SSE 流式响应。"""
     uid = user["id"]
     user_content = (req.message or "").strip()
-    if not user_content and not req.from_id:
+    turn_attachments = []
+    if req.attachment_ids and not req.from_id:
+        turn_attachments = await _db_call(fetch_pending, uid, list(req.attachment_ids))
+        if turn_attachments is None:
+            error("invalid_attachment", "附件不存在或已使用", 400)
+    if not user_content and not turn_attachments and not req.from_id:
         error("empty_message", "消息不能为空", 400)
 
     data = await _db_call(resolve_slot, uid, req.slot_index)
@@ -459,7 +701,6 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
 
     async def stream():
         completed = False
-        rollback_start_id = None
         persist_user = True
         inject_user = True
         local_history = list(history)
@@ -486,7 +727,7 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
                     })
                     return
                 local_content = local_content or (target.get("content") or "").strip()
-                if not local_content:
+                if not local_content and not (target.get("attachments") or []):
                     yield _sse({
                         "type": "error",
                         "code": "empty_message",
@@ -521,7 +762,11 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
             if not dual_enabled or (not run_model1 and not run_model2):
                 # 退化为单模型（未开启双模型，或双模型无有效回复模式）
                 if persist_user:
-                    local_history.append({"role": "user", "content": local_content})
+                    local_history.append({
+                        "role": "user",
+                        "content": local_content,
+                        "attachments": turn_attachments,
+                    })
                 actual_model = model
                 actual_prompt = system_prompt
                 actual_params = params
@@ -530,18 +775,23 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
                 max_tokens = rt.get("max_tokens")
 
                 context_history = _truncate_history(local_history)
-                messages = [{"role": "system", "content": actual_prompt}, *_clean(context_history)]
+                messages = [
+                    {"role": "system", "content": actual_prompt},
+                    *(await _to_model_messages(uid, context_history)),
+                ]
 
+                run = _active_run()
                 chunks = []
                 if persist_user:
-                    saved_ids = await _db_call(get_slot_mgr().append_messages, uid, req.slot_index, [
-                        {"role": "user", "content": local_content},
-                    ])
+                    saved_ids = await _tracked_db(
+                        run, _append_tracked, run, uid, req.slot_index,
+                        [{"role": "user", "content": local_content, "attachments": turn_attachments}],
+                    )
                     if not saved_ids:
                         raise RuntimeError("数据库写入用户消息失败")
                     user_msg_id = saved_ids[0] if saved_ids else None
-                    if rollback_start_id is None and saved_ids:
-                        rollback_start_id = saved_ids[0]
+                if run is not None and run.cancel_event.is_set():
+                    return
 
                 async for chunk in get_ai_client().stream_chat(
                     messages,
@@ -550,22 +800,28 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
                     api_key=rt["api_key"],
                     max_tokens=max_tokens,
                     params=actual_params,
+                    **_stream_kwargs(run),
                 ):
                     chunks.append(chunk)
                     yield _sse({'type': 'chunk', 'content': chunk})
 
+                if run is not None and run.cancel_event.is_set():
+                    return
+
                 full_response = "".join(chunks)
-                msg_ids = await _db_call(get_slot_mgr().append_messages, uid, req.slot_index, [
-                    {"role": "assistant", "content": full_response, "source": "single"},
-                ])
+                msg_ids = await _tracked_db(
+                    run, _append_tracked, run, uid, req.slot_index,
+                    [{"role": "assistant", "content": full_response, "source": "single"}],
+                )
                 if not msg_ids:
                     raise RuntimeError("数据库写入模型回复失败")
                 local_history.append({"role": "assistant", "content": full_response})
 
                 if persist_user and not fresh.get("title", ""):
+                    title_src = local_content or _attachment_title(turn_attachments)
                     if not await _db_call(
                         get_slot_mgr().update_slot_meta,
-                        uid, req.slot_index, {"title": _auto_title(req.slot_index, local_content)}
+                        uid, req.slot_index, {"title": _auto_title(req.slot_index, title_src)}
                     ):
                         logger.warning(f"自动更新存档 #{req.slot_index + 1} 标题失败")
 
@@ -574,13 +830,16 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
                     'user_message_id': user_msg_id,
                     'assistant_message_id': msg_ids[0] if msg_ids else None,
                 }
-                yield _sse(done_event)
                 completed = True
+                if run is not None:
+                    run.completed = True
+                yield _sse(done_event)
                 return
 
             # ── 双模型模式（共享助手：自行落库、发事件、处理错误与回滚） ──
             gen = _stream_dual_turn(
                 uid, req.slot_index, fresh, local_history, local_content,
+                user_attachments=turn_attachments if persist_user else None,
                 persist_user=persist_user,
                 inject_user=inject_user,
                 existing_user_id=user_msg_id,
@@ -600,8 +859,15 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
             finally:
                 await gen.aclose()
             completed = dual_done
+            if dual_done:
+                dual_run = _active_run()
+                if dual_run is not None:
+                    dual_run.completed = True
 
-        except GeneratorExit:
+        except GenerationCancelled:
+            return
+
+        except (asyncio.CancelledError, GeneratorExit):
             raise
 
         except ConnectionError as e:
@@ -617,21 +883,9 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
             yield _sse(_exception_error_event(e, "user_message_id", user_msg_id))
 
         finally:
-            if not completed and rollback_start_id is not None:
-                try:
-                    await _db_call(
-                        get_slot_mgr().delete_messages_from,
-                        uid,
-                        req.slot_index,
-                        rollback_start_id,
-                    )
-                    logger.info(
-                        f"流中断，已回滚存档 #{req.slot_index + 1} 的消息（起点 #{rollback_start_id}）"
-                    )
-                except Exception as e:
-                    logger.warning(f"回滚失败: {e}")
+            await _await_cleanup(_rollback_run(_active_run()))
             if not completed and snapshot and req.from_id:
-                try:
+                async def _restore_snapshot():
                     remaining = await _db_call(
                         get_slot_mgr().list_messages_after,
                         uid, req.slot_index, req.from_id,
@@ -649,6 +903,8 @@ async def chat(req: ChatRequest, user: dict = Depends(current_user)):
                             logger.warning(
                                 f"重新生成失败，写回存档 #{req.slot_index + 1} 消息未成功"
                             )
+                try:
+                    await _await_cleanup(_restore_snapshot())
                 except Exception as e:
                     logger.warning(f"恢复消息失败: {e}")
 
@@ -729,8 +985,11 @@ async def continue_chat(slot_index: int, user: dict = Depends(current_user)):
         max_tokens = rt.get("max_tokens")
 
         context_history = _truncate_history(history)
-        messages = [{"role": "system", "content": cfg_system}, *_clean(context_history)]
-        messages.append({"role": "user", "content": CONTINUE_PROMPT})
+        messages = [
+            {"role": "system", "content": cfg_system},
+            *(await _to_model_messages(uid, context_history)),
+            {"role": "user", "content": CONTINUE_PROMPT},
+        ]
 
         try:
             yield _sse({
@@ -741,6 +1000,7 @@ async def continue_chat(slot_index: int, user: dict = Depends(current_user)):
                 "message_id": message_id,
             })
 
+            run = _active_run()
             chunks = []
             async for chunk in get_ai_client().stream_chat(
                 messages,
@@ -749,9 +1009,13 @@ async def continue_chat(slot_index: int, user: dict = Depends(current_user)):
                 api_key=rt["api_key"],
                 max_tokens=max_tokens,
                 params=cfg_params,
+                **_stream_kwargs(run),
             ):
                 chunks.append(chunk)
                 yield _sse({"type": "chunk", "content": chunk, "role": "single"})
+
+            if run is not None and run.cancel_event.is_set():
+                return
 
             full_response = "".join(chunks)
             if full_response and message_id:
@@ -771,7 +1035,10 @@ async def continue_chat(slot_index: int, user: dict = Depends(current_user)):
                 "continue": True,
             })
 
-        except GeneratorExit:
+        except GenerationCancelled:
+            return
+
+        except (asyncio.CancelledError, GeneratorExit):
             raise
 
         except Exception as e:

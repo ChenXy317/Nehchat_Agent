@@ -368,6 +368,7 @@ class AccountManager:
         conn = self.pool.connection()
         try:
             with conn.cursor() as cursor:
+                cursor.execute("DELETE FROM uploads WHERE user_id = %s", (user_id,))
                 cursor.execute("DELETE FROM messages WHERE user_id = %s", (user_id,))
                 cursor.execute("DELETE FROM slots WHERE user_id = %s", (user_id,))
                 cursor.execute("DELETE FROM providers WHERE user_id = %s", (user_id,))

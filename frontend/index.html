@@ -78,7 +78,7 @@
             <li><strong>先选提供商，再选模型：</strong>下拉只显示你在模型配置里添加的供应商与模型</li>
             <li><strong>单模型：</strong>调整参数 → 设置系统提示词与标题 → 即可开始对话</li>
             <li><strong>双模型：</strong>分别配置两个模型（角色名、提供商、模型、参数、提示词），两个模型会依次回答，适合角色扮演</li>
-            <li>输入消息后按 <kbd>Enter</kbd> 发送，<kbd>Shift</kbd>+<kbd>Enter</kbd> 换行</li>
+            <li>输入消息后按 <kbd>Enter</kbd> 发送，<kbd>Shift</kbd>+<kbd>Enter</kbd> 换行。输入框左侧可附加图片或文本，也可以直接粘贴截图</li>
             <li>不想输入新消息时，点「<strong>⏩ 继续</strong>」：单模型延续上一条回复，双模型则两个模型各回复一轮</li>
           </ol>
         </section>
@@ -102,7 +102,8 @@
             <li><strong>双模型回复模式：</strong>在侧栏切换「同时回复 / 仅模型1 / 仅模型2」及谁先回复；模型2 会看到模型1 的回复</li>
             <li><strong>重新生成：</strong>悬停 AI 回复，点击 ↻ 重新生成该条回复，最后一条的 ↻ 常亮</li>
             <li><strong>编辑消息：</strong>悬停自己的消息点 ✏️ 编辑（保存后自动重发）</li>
-            <li><strong>取消回复：</strong>回复中点击顶栏 ■ 可取消，已写入的消息会回滚并恢复到输入框</li>
+            <li><strong>取消回复：</strong>回复中点击顶栏 ■ 可取消。未完成的这一轮会撤掉，刚发送的内容回到输入框</li>
+            <li><strong>图片与文件：</strong>支持 jpg、png、webp、gif（单张 8MB 内）以及 txt、md、csv、json、log。图片会发给模型查看，需要模型本身支持视觉</li>
             <li><strong>编辑标题：</strong>在侧栏点击标题或 ✏️ 按钮即可重命名存档</li>
             <li><strong>导出对话：</strong>侧栏「导出对话」可将整段对话导出为 Markdown</li>
             <li><strong>连通性测试：</strong>模型配置中每个已保存的模型旁可点「测试」，发送 hello 查看是否能收到回复</li>
@@ -673,8 +674,15 @@
 
         <!-- Input area -->
         <div id="input-area">
+          <div id="attach-preview" class="attach-preview hidden"></div>
           <div class="input-wrapper">
-            <textarea id="message-input" rows="1" placeholder="输入消息…"></textarea>
+            <button id="attach-btn" type="button" class="attach-btn" title="上传图片或文本">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M21.44 11.05l-9.19 9.19a6 6 0 01-8.49-8.49l9.19-9.19a4 4 0 015.66 5.66l-9.2 9.19a2 2 0 01-2.83-2.83l8.49-8.48"/>
+              </svg>
+            </button>
+            <input id="attach-input" type="file" accept="image/jpeg,image/png,image/webp,image/gif,.jpg,.jpeg,.png,.webp,.gif,.txt,.md,.csv,.json,.log" multiple hidden />
+            <textarea id="message-input" rows="1" placeholder="输入消息，可附加图片…"></textarea>
             <button id="continue-btn" class="continue-btn" title="继续回复：无需输入消息，让 AI 继续对话（双模型时两个模型都会回复）">⏩ <span class="continue-label">继续</span></button>
             <button id="send-btn" class="send-btn" title="发送">
               <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">

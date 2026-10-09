@@ -166,7 +166,14 @@ export function renderMessages(history) {
       }
     }
 
-    const bubble = addMessage(isUser ? "user" : "assistant", msg.content, false, messageId, label);
+    const bubble = addMessage(
+      isUser ? "user" : "assistant",
+      msg.content,
+      false,
+      messageId,
+      label,
+      msg.attachments || null,
+    );
 
     if (isUser) {
       lastUserMsgId = messageId;
@@ -191,7 +198,30 @@ export function renderMessages(history) {
   updateContinueBtn();
 }
 
-export function addMessage(role, content, isStreaming = false, messageId = null, label = null) {
+function renderAttachments(bubble, attachments) {
+  if (!attachments || !attachments.length) return;
+  const wrap = document.createElement("div");
+  wrap.className = "bubble-attachments";
+  for (const att of attachments) {
+    if (att.kind === "image" && att.url) {
+      const img = document.createElement("img");
+      img.className = "bubble-attachment bubble-attachment-image";
+      img.src = att.url;
+      img.alt = att.name || "图片";
+      img.title = att.name || "图片";
+      img.addEventListener("click", () => window.open(img.src, "_blank", "noopener"));
+      wrap.appendChild(img);
+    } else {
+      const chip = document.createElement("div");
+      chip.className = "bubble-attachment file-chip";
+      chip.textContent = att.name || "文件";
+      wrap.appendChild(chip);
+    }
+  }
+  bubble.appendChild(wrap);
+}
+
+export function addMessage(role, content, isStreaming = false, messageId = null, label = null, attachments = null) {
   const container = el("chat-messages");
   if (!container) return null;
 
@@ -231,6 +261,8 @@ export function addMessage(role, content, isStreaming = false, messageId = null,
     labelBar.textContent = label;
     bubble.appendChild(labelBar);
   }
+
+  renderAttachments(bubble, attachments);
 
   const contentDiv = document.createElement("div");
   contentDiv.className = "bubble-content";
@@ -386,6 +418,8 @@ export function setStreaming(val) {
 
   if (sendBtn) sendBtn.disabled = val;
   if (sendBtn) sendBtn.classList.toggle("sending", val);
+  const attachBtn = el("attach-btn");
+  if (attachBtn) attachBtn.disabled = val;
   if (cancelBtn) cancelBtn.classList.toggle("hidden", !val);
   if (statusBadge) statusBadge.classList.toggle("hidden", !val);
   if (inputStatus) {

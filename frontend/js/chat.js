@@ -21,6 +21,10 @@ import {
   addErrorMessage,
   loadSlots,
 } from "./ui.js";
+import { hasPending, restorePending, takePending, uploadAttachment } from "./attachments.js";
+
+let currentCancelPromise = null;
+let lastCancelRolledBack = false;
 
 /** 给消息元素挂载 ↻ 重新生成按钮（记录所属用户消息 ID） */
 function attachRegenBtn(msgDiv, userMsgId) {
@@ -140,9 +144,14 @@ export async function sendMessage(opts = {}) {
   const input = document.getElementById("message-input");
   const fromId = Number.isInteger(opts.fromId) ? opts.fromId : null;
   const text = (opts.text ?? input.value).trim();
+  const fromHasAttachments = !!opts.userDiv?.querySelector(".bubble-attachment");
+  const staged = fromId ? [] : (hasPending() ? takePending() : []);
 
-  if (!text || state.streaming) return;
-  if (state.currentSlotIndex === null) return;
+  if (state.streaming || state.currentSlotIndex === null) {
+    if (staged.length) restorePending(staged);
+    return;
+  }
+  if (!text && staged.length === 0 && !(fromId && fromHasAttachments)) return;
 
   // 清理上一轮遗留的错误提示
   document.querySelectorAll("#chat-messages .message.error").forEach((el) => el.remove());
@@ -151,7 +160,12 @@ export async function sendMessage(opts = {}) {
   if (!fromId) {
     input.value = "";
     input.style.height = "auto";
-    const userMsgBubble = addMessage("user", text, false);
+    const previews = staged.map((item) => ({
+      name: item.name,
+      kind: item.kind,
+      url: item.previewUrl,
+    }));
+    const userMsgBubble = addMessage("user", text, false, null, null, previews);
     userMsgDiv = userMsgBubble ? userMsgBubble.closest(".message") : null;
   } else if (userMsgDiv) {
     const bubble = userMsgDiv.querySelector(".bubble");
@@ -175,11 +189,33 @@ export async function sendMessage(opts = {}) {
   let streamError = null;
   let streamRetry = null;
 
+  let uploadedIds = [];
   try {
+    if (staged.length) {
+      try {
+        for (const item of staged) {
+          const meta = await uploadAttachment(item.file);
+          uploadedIds.push(meta.id);
+          if (item.kind === "image" && userMsgDiv && meta.url) {
+            const img = [...userMsgDiv.querySelectorAll(".bubble-attachment-image")]
+              .find((node) => node.src === item.previewUrl);
+            if (img) img.src = meta.url;
+          }
+        }
+      } catch (uploadError) {
+        restorePending(staged);
+        if (userMsgDiv) userMsgDiv.remove();
+        fillMessageInput(text);
+        showToast(uploadError.message || "上传失败", "error");
+        setStreaming(false);
+        return;
+      }
+    }
     const payload = {
       slot_index: state.currentSlotIndex,
       message: text,
     };
+    if (uploadedIds.length) payload.attachment_ids = uploadedIds;
     if (fromId) payload.from_id = fromId;
     await postSse("/api/chat", payload, (event) => {
       const { type, content, code } = event;
@@ -309,6 +345,7 @@ export async function sendMessage(opts = {}) {
               currentBubble = null;
             }
             if (userMsgDiv && !fromId) userMsgDiv.remove();
+            if (!fromId && staged.length) restorePending(staged);
           }
           streamError = streamErrorText(code, content);
           streamRetry = (hasCompleted || fromId) ? null : text;
@@ -335,17 +372,16 @@ export async function sendMessage(opts = {}) {
         currentBubble = null;
       }
       if (userMsgDiv && !fromId) userMsgDiv.remove();
+      if (!fromId && staged.length) restorePending(staged);
       streamError = `请求失败: ${e.message}`;
       streamRetry = fromId ? null : text;
     }
   } finally {
-    // 手动取消（streamCancelled）与超时中断（aborted）都需回滚本轮气泡；
-    // 手动取消时额外提示一次，超时已有独立提示
     if (state.streamCancelled) {
-      rollbackMessages(text, { keepUser: !!fromId });
+      rollbackMessages(text, { keepUser: !!fromId, userDiv: userMsgDiv, bubbles, restoreInput: false });
       showToast("已取消", "info");
     } else if (aborted) {
-      rollbackMessages(text, { keepUser: !!fromId });
+      rollbackMessages(text, { keepUser: !!fromId, userDiv: userMsgDiv, bubbles, restoreInput: false });
     }
   }
 
@@ -353,49 +389,114 @@ export async function sendMessage(opts = {}) {
     gotDone, errorHandled, aborted,
     errorText: streamError, retryText: streamRetry,
     reloadHistory: !!fromId,
+    restoreText: (!fromId && (state.streamCancelled || aborted)) ? text : null,
+    stagedFiles: staged,
   });
+  if (gotDone) {
+    for (const item of staged) {
+      if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    }
+  }
   document.getElementById("message-input")?.focus();
+}
+
+function fillMessageInput(text) {
+  const msgInput = document.getElementById("message-input");
+  if (!msgInput) return;
+  msgInput.value = text || "";
+  msgInput.style.height = "auto";
+  if (text) {
+    msgInput.style.height = Math.min(msgInput.scrollHeight, 120) + "px";
+  }
+  msgInput.focus();
+  try {
+    const len = (text || "").length;
+    msgInput.setSelectionRange(len, len);
+  } catch (_) { /* 忽略不支持选择范围的场景 */ }
 }
 
 async function refreshSlotAfterStream({
   gotDone, errorHandled, aborted, errorText = null, retryText = null, reloadHistory = false,
+  restoreText = null, stagedFiles = null,
 }) {
+  const isCancelled = state.streamCancelled || aborted;
+
+  if (isCancelled && currentCancelPromise) {
+    try {
+      await currentCancelPromise;
+    } catch (_) { /* 忽略 */ }
+    currentCancelPromise = null;
+  }
+
   if (state.currentSlotIndex !== null) {
     try {
       state.currentSlotData = await apiGet(`/api/slots/${state.currentSlotIndex}/chat`);
       state.dualEnabled = state.currentSlotData.dual_enabled || false;
       state.responseMode = state.currentSlotData.response_mode || "both";
       state.firstModel = state.currentSlotData.first_model || "model1";
-      // 新消息取消时 DOM 已回滚，不能用尚未删干净的服务端快照把用户消息画回来
-      if (!gotDone && (reloadHistory || (!errorHandled && !state.streamCancelled && !aborted))) {
+
+      if (isCancelled && !gotDone) {
+        const hist = state.currentSlotData.history || [];
+        const last = hist[hist.length - 1];
+        const pendingUser = typeof restoreText === "string"
+          && restoreText.trim()
+          && last
+          && last.role === "user"
+          && (last.content || "").trim() === restoreText.trim();
+        // 这一轮已完整落库时保留历史；未完成则把原文放回输入框
+        const putBack = typeof restoreText === "string" && (lastCancelRolledBack || !pendingUser);
+        if (putBack && pendingUser) hist.pop();
+        state.currentSlotData.history = hist;
+        renderMessages(hist);
+        if (putBack) {
+          fillMessageInput(restoreText);
+          if (stagedFiles?.length) restorePending(stagedFiles);
+        } else if (typeof restoreText === "string") {
+          fillMessageInput("");
+        }
+      } else if (!gotDone && (reloadHistory || !errorHandled)) {
         renderMessages(state.currentSlotData.history || []);
       }
-      if (!gotDone && errorText && !state.streamCancelled) {
+      if (!gotDone && errorText && !isCancelled) {
         addErrorMessage(errorText, retryText);
       }
       updateSidebarInfo();
     } catch (_) { /* 静默失败 */ }
+  } else if (typeof restoreText === "string") {
+    fillMessageInput(restoreText);
   }
   setStreaming(false);
   state.streamCancelled = false;
   state.currentReader = null;
 }
 
-function rollbackMessages(text, { keepUser = false } = {}) {
+function rollbackMessages(text, { keepUser = false, userDiv = null, bubbles = [], restoreInput = true } = {}) {
+  if (Array.isArray(bubbles)) {
+    bubbles.forEach(b => {
+      if (b && b.el) {
+        const d = getMsgDiv(b.el);
+        if (d) d.remove();
+      }
+    });
+  }
+
+  if (!keepUser && userDiv) {
+    userDiv.remove();
+  }
+
   const allMsgs = document.querySelectorAll("#chat-messages > .message");
-  const msgsToRemove = [];
   for (let i = allMsgs.length - 1; i >= Math.max(0, allMsgs.length - 5); i--) {
     const m = allMsgs[i];
     if (m && m.classList.contains("assistant")) {
-      msgsToRemove.push(m);
+      m.remove();
       continue;
     }
     if (m && m.classList.contains("user")) {
-      if (!keepUser) msgsToRemove.push(m);
+      if (!keepUser) m.remove();
       break;
     }
   }
-  msgsToRemove.forEach(m => m?.remove());
+
   if (!document.querySelector("#chat-messages .message")) {
     document.getElementById("chat-messages").innerHTML = `
       <div class="empty-state">
@@ -404,12 +505,28 @@ function rollbackMessages(text, { keepUser = false } = {}) {
         <div class="empty-desc">在下方输入消息，与 AI 开始交流</div>
       </div>`;
   }
-  if (keepUser) return;
+
+  if (!keepUser && state.currentSlotData && Array.isArray(state.currentSlotData.history)) {
+    const hist = state.currentSlotData.history;
+    if (hist.length > 0 && hist[hist.length - 1].role === "user") {
+      hist.pop();
+    }
+  }
+
+  if (keepUser || !restoreInput) return;
+
   const msgInput = document.getElementById("message-input");
   if (msgInput) {
-    msgInput.value = text;
+    msgInput.value = text || "";
     msgInput.style.height = "auto";
+    if (text) {
+      msgInput.style.height = Math.min(msgInput.scrollHeight, 120) + "px";
+    }
     msgInput.focus();
+    try {
+      const len = (text || "").length;
+      msgInput.setSelectionRange(len, len);
+    } catch (_) { /* 忽略不支持选择范围的场景 */ }
   }
 }
 
@@ -663,20 +780,27 @@ export async function regenerate(userMsgId) {
 // ── 取消流式回复 ──
 
 export function cancelStream() {
-  if (!state.streaming) return;
+  if (!state.streaming || state.streamCancelled) return;
   state.streamCancelled = true;
+  lastCancelRolledBack = false;
   const currentSlot = state.currentSlotIndex;
-  if (state.currentReader) {
-    try { state.currentReader.cancel(); } catch (_) { /* 忽略 */ }
-    state.currentReader = null;
-  }
-  if (state.abortController) {
-    state.abortController.abort();
-    state.abortController = null;
-  }
-  if (currentSlot !== null) {
-    apiPost(`/api/slots/${currentSlot}/chat/cancel`, {}).catch(() => {});
-  }
+  // 先等服务端停掉模型并回滚，再断开本地读取。先断开的话，清理会被取消打断，存档锁会卡住。
+  currentCancelPromise = (async () => {
+    try {
+      if (currentSlot !== null) {
+        const resp = await apiPost(`/api/slots/${currentSlot}/chat/cancel`, {});
+        lastCancelRolledBack = !!resp?.rolled_back;
+      }
+    } catch (_) { /* 忽略 */ }
+    if (state.currentReader) {
+      try { await state.currentReader.cancel(); } catch (_) { /* 忽略 */ }
+      state.currentReader = null;
+    }
+    if (state.abortController) {
+      try { state.abortController.abort(); } catch (_) { /* 忽略 */ }
+      state.abortController = null;
+    }
+  })();
 }
 
 // ── 编辑用户消息 ──
@@ -693,7 +817,8 @@ export function editAndResend(msgElement) {
   const originalText = bubble.dataset.rawContent
     || bubble.querySelector(".bubble-content")?.textContent
     || "";
-  if (!originalText) return;
+  const hasAttachments = !!msgElement.querySelector(".bubble-attachment");
+  if (!originalText && !hasAttachments) return;
 
   const textarea = document.createElement("textarea");
   textarea.className = "edit-textarea";
@@ -733,7 +858,7 @@ export function editAndResend(msgElement) {
 
   saveBtn.onclick = async () => {
     const newText = textarea.value.trim();
-    if (!newText) {
+    if (!newText && !hasAttachments) {
       showToast("内容不能为空", "warning");
       return;
     }

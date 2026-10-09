@@ -103,6 +103,10 @@ class AIClientError(Exception):
         self.error_code = error_code
 
 
+class GenerationCancelled(Exception):
+    """调用方主动停止生成，不算上游故障。"""
+
+
 class AIClient:
     def __init__(self):
         self._clients: Dict[Tuple[str, str, float], AsyncOpenAI] = {}
@@ -192,20 +196,37 @@ class AIClient:
         api_key: str,
         max_tokens: int | None = None,
         params: dict | None = None,
+        cancel_event: asyncio.Event | None = None,
+        on_stream=None,
     ) -> AsyncGenerator[str, None]:
-        """异步生成器，逐块产出回复文本（适配 SSE）。"""
+        """异步生成器，逐块产出回复文本（适配 SSE）。
+
+        cancel_event 被设置或 on_stream 登记的流被关闭时，抛出 GenerationCancelled。
+        """
         client = self._get_client(base_url, api_key)
         base_kwargs = self._build_kwargs(messages, model_id, max_tokens, params, stream=True)
+
+        def _cancelled() -> bool:
+            return cancel_event is not None and cancel_event.is_set()
 
         last_exception = None
         started = False
         stripper = _ThinkStripper()
         use_extra = base_url not in self._thinking_extra_rejected
         for attempt in range(_API_RETRY_MAX + 1):
+            stream = None
             try:
+                if _cancelled():
+                    raise GenerationCancelled()
                 kwargs = self._with_thinking_off(base_kwargs, base_url) if use_extra else base_kwargs
                 stream = await client.chat.completions.create(**kwargs)
+                if on_stream:
+                    on_stream(stream)
+                if _cancelled():
+                    raise GenerationCancelled()
                 async for chunk in stream:
+                    if _cancelled():
+                        raise GenerationCancelled()
                     text = self._delta_text(chunk)
                     if not text:
                         continue
@@ -213,12 +234,18 @@ class AIClient:
                     visible = stripper.feed(text)
                     if visible:
                         yield visible
+                if _cancelled():
+                    raise GenerationCancelled()
                 tail = stripper.flush()
                 if tail:
                     yield tail
                 return
+            except GenerationCancelled:
+                raise
             except (RateLimitError, APITimeoutError, APIConnectionError, APIStatusError,
                     APIError, httpx.TimeoutException, httpx.NetworkError) as e:
+                if _cancelled():
+                    raise GenerationCancelled() from e
                 if started:
                     logger.warning(f"流式响应已开始后中断（不重试，避免内容重复）: {e}")
                     raise AIClientError("回复生成中途中断，请重试", "stream_interrupted") from e
@@ -277,6 +304,17 @@ class AIClient:
                     await asyncio.sleep(_API_RETRY_DELAY * (2 ** attempt))
                     continue
                 raise AIClientError(f"API 请求失败: {e}", "request_failed") from e
+            finally:
+                if on_stream:
+                    on_stream(None)
+                close = getattr(stream, "close", None)
+                if close:
+                    try:
+                        result = close()
+                        if hasattr(result, "__await__"):
+                            await result
+                    except Exception:
+                        logger.debug("关闭上游模型流时出错", exc_info=True)
 
         raise AIClientError(
             f"API 请求失败 (已重试 {_API_RETRY_MAX} 次): {last_exception}",

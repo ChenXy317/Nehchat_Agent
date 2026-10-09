@@ -50,6 +50,14 @@ BACKGROUNDS_DIR = BASE_DIR / "backgrounds"
 BACKGROUND_ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
 BACKGROUND_MAX_SIZE = 10 * 1024 * 1024  # 10MB
 
+# ── 对话附件（图片交给视觉模型，文本并入提示词） ──
+UPLOADS_DIR = BASE_DIR / "uploads"
+UPLOAD_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+UPLOAD_MAX_TEXT_BYTES = 512 * 1024
+UPLOAD_MAX_COUNT = 4
+UPLOAD_MAX_CONTEXT_IMAGES = 4
+UPLOAD_MAX_TEXT_CHARS = 60_000
+
 # MySQL 配置（密码必须通过环境变量设置，不提供默认值）
 MYSQL_HOST = os.environ.get("MYSQL_HOST", "localhost")
 _mysql_port_raw = os.environ.get("MYSQL_PORT", "3306")

@@ -25,6 +25,7 @@ import { initCatalog, bindCatalogUi, closeCatalogModal } from "./catalog.js";
 
 // ── 对话 ──
 import { sendMessage, cancelStream, backToSlots, clearSlotChat, regenerate, setDualResponseMode, continueLastReply } from "./chat.js";
+import { bindAttachmentUi } from "./attachments.js";
 
 // ── 工具 ──
 import { $ } from "./utils.js";
@@ -105,6 +106,8 @@ function setupEventListeners() {
   $("#theme-modal").addEventListener("click", (e) => {
     if (e.target.id === "theme-modal") closeThemeModal();
   });
+
+  bindAttachmentUi();
 
   // 发送
   $("#send-btn").addEventListener("click", sendMessage);

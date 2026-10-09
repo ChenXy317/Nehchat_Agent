@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends
 
 from auth import current_user
 from config import BACKGROUNDS_DIR
+from attachments import cleanup_user_dir
 from helpers import error
 from models import AdminCreateUserRequest, AdminUpdateUserRequest
 from state import get_auth_mgr
@@ -112,5 +113,6 @@ def delete_user(user_id: int, admin: dict = Depends(require_admin)):
         error("user_not_found", "用户不存在", 404)
 
     _remove_user_backgrounds(user_id)
+    cleanup_user_dir(user_id)
     logger.info(f"管理员 {admin.get('username')} 删除账号 #{user_id} ({target.get('username')})")
     return {"ok": True}

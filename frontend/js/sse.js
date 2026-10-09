@@ -57,13 +57,15 @@ export async function readSse(response, onEvent, idleMs = 60_000) {
   try {
     while (true) {
       const { done, value } = await reader.read();
-      if (state.streamCancelled || done) break;
+      if (done) break;
       lastChunkTime = Date.now();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split("\n");
       buffer = lines.pop() || "";
       for (const line of lines) {
         if (!line.startsWith("data: ")) continue;
+        // 停止后继续读完响应，避免服务端清理被未读完的流堵住；事件本身不再分发
+        if (state.streamCancelled) continue;
         try {
           onEvent(JSON.parse(line.slice(6)));
         } catch (_) { /* 忽略解析错误 */ }
